@@ -1,0 +1,786 @@
+---
+title: "R - using Random Forests, Support Vector Machines and Neural Networks for a pixel based supervised classification of Sentinel-2 multispectral images"
+author: "by [Valentin Stefan](https://github.com/valentinitnelav) - last update `r format(Sys.time(), '%d %B %Y')`"
+linkedin: "valentin-stefan"
+twitter: "VaS529"
+github: "valentinitnelav"
+output:
+  epuRate::epurate:
+    toc: TRUE
+    number_sections: FALSE
+    code_folding: "show"
+---
+
+<style>
+#TOC {
+  top: 1%;
+  opacity: 0.5;
+}
+#TOC:hover {
+  opacity: 1;
+}
+</style>
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+# devtools::install_github("holtzy/epuRate")
+library(epuRate)
+library(rmarkdown)
+library(png)
+library(grid)
+library(raster)
+library(ncdf4)
+
+# For avoiding long waiting time, read already saved/cached objects
+records <- readRDS(file = "./cache/records.rds")
+datasets <- readRDS(file = "./cache/datasets.rds")
+rst_crop_lst <- lapply(list.files("./data/crop",
+                                  pattern = "^B.{2}\\.tif$",
+                                  full.names = TRUE),
+                       FUN = raster)
+names(rst_crop_lst) <- sapply(rst_crop_lst, names)
+
+brick_for_prediction <- brick("./cache/temp/r_tmp_2019-04-02_215609_8472_60792.gri")
+
+model_rf <- readRDS(file = "./cache/model_rf.rds")
+model_svm <- readRDS(file = "./cache/model_svm.rds")
+model_nnet <- readRDS(file = "./cache/model_nnet.rds")
+```
+
+# Summary
+
+Implementing a classic [pixel based][px-b] [supervised classification][sup-cl]/[supervised learning][sup-ln] of [Sentinel-2 multispectral images][s2] for an area in central Romania. I used the framework provided by the [caret][caret] R package ("Classification and Regression Training"). I compered predictions from Random Forests with those from SVM and Neural Networks.
+
+Bands used: B2, B3, B4, B5, B6, B7, B8, B8A, B11 and B12, so ten out of the total [thirteen spectral bands][spec-b]. I didn't use the 60 m bands "Band 1 - Coastal aerosol", "Band 9 - Water vapour" & "Band 10 - SWIR - Cirrus" ([wiki table][wk-tbl]), which carry information about atmospheric water content. There was no further thought invested into what combinations of bands to use.
+
+Downloaded the "Level-2A" processed data sets (Level-2A = bottom-of-atmosphere reflectance in cartographic geometry). For downloading I used the framework provided by the R package [getSpatialData][getSpatialData], which connects to the [Copernicus Open Access Hub][COAH].
+
+Digitization of training polygons was carried in QGIS using the Bing aerial imagery and the True Color Image (TCI) at 10 m resulution in background for visual validation. Five classes were identified for this exercise: *agriculture, construction, forest, pasture and water*.
+
+**Disclaimer**: This is work in progress based on my own exploration with the methods. Treat this content as a blog post and nothing more. It does not have the pretention to be an exhaustive exercise nor a replacement for your critical thinking. If you find mistakes/bottle necks/bugs in my work, please let me know by opening an issue or can also let me know on [twitter][twitter].
+
+[px-b]: https://gis.stackexchange.com/questions/237461/distinction-between-pixel-based-and-object-based-classification
+[sup-cl]: https://articles.extension.org/pages/40214/whats-the-difference-between-a-supervised-and-unsupervised-image-classification
+[sup-ln]: https://stackoverflow.com/questions/1832076/what-is-the-difference-between-supervised-learning-and-unsupervised-learning
+[s2]: https://sentinel.esa.int/web/sentinel/missions/sentinel-2
+[caret]: https://cran.r-project.org/web/packages/caret/index.html
+[spec-b]: https://earth.esa.int/web/sentinel/user-guides/sentinel-2-msi/resolutions/spatial
+[wk-tbl]: https://en.wikipedia.org/wiki/Sentinel-2#Instruments
+[getSpatialData]: https://github.com/16EAGLE/getSpatialData
+[COAH]: https://scihub.copernicus.eu/
+[twitter]: https://twitter.com/VaS529
+
+# The R environment {.tabset .tabset-fade}
+
+## Load packages
+
+```{r load-packages, message=FALSE, warning=FALSE}
+# Packages for spatial data processing & visualization
+library(rgdal)
+library(gdalUtils)
+library(raster)
+library(sf)
+library(sp)
+library(RStoolbox)
+library(getSpatialData)
+library(rasterVis)
+library(mapview)
+
+library(RColorBrewer)
+library(plotly)
+library(grDevices)
+
+# Machine learning packages
+library(caret)
+library(randomForest)
+library(ranger)
+library(MLmetrics)
+library(nnet)
+library(NeuralNetTools)
+library(LiblineaR)
+
+# Packages for general data processing and parallel computation
+library(data.table)
+library(dplyr)
+library(stringr)
+library(doParallel)
+library(snow)
+library(parallel)
+
+# set the temporary folder for raster package operations
+rasterOptions(tmpdir = "./cache/temp")
+```
+
+## R Session
+
+```{r r-session-info}
+sessionInfo()
+```
+
+## Checkpoint
+
+If you want to install a snapshot of the packages as they existed on CRAN at the creation of this document, then can use the [checkpoint][checkpoint] package:
+
+[checkpoint]: https://cran.r-project.org/web/packages/checkpoint/index.html
+
+```{r checkpoint, eval=FALSE}
+# /////////////////////////////////////////////////////////////////////////
+#
+# Create a checkpoint at "2019-03-23".
+#
+# This should guarantee the same versions of the packages as they existed at the
+# specified point in time.
+# 
+# Scans for packages in the project folder and its subfolder. It scans all R code
+# (.R, .Rmd, and .Rpres files) for `library()` and `require()` statements. Then
+# creates a local library into which it installs a copy of the packages required
+# in the project as they existed on CRAN at the specified snapshot date. See
+# details with ?checkpoint after you load library(checkpoint), or here:
+# https://cran.r-project.org/web/packages/checkpoint/vignettes/checkpoint.html
+#
+# Warning: Installing older versions of the packages in the .checkpoint local
+# library, may take up some hundreds of MG in space.
+#
+# /////////////////////////////////////////////////////////////////////////
+
+# install.packages("checkpoint")
+library(checkpoint) # checkpoint, version 0.4.5
+
+checkpoint(snapshotDate = "2019-03-23")
+
+# Check that library path is set to ~/.checkpoint/2019-03-23/ ...
+.libPaths()
+grepl(pattern = "\\.checkpoint/2019-03-23/", x = .libPaths()[1]) # should be TRUE
+
+
+# Optional checks ---------------------------------------------------------
+
+# Check that CRAN mirror is set to MRAN snapshot
+getOption("repos")
+# At first run, after installing the packages, should see something like:
+#                                                                            nowosaddrat 
+# "https://mran.microsoft.com/snapshot/2019-03-23"     "https://nowosad.github.io/drat/" 
+
+# Check which packages are installed in checkpoint library
+installed.packages(.libPaths()[1])[, "Package"]
+
+# Experimental - use unCheckpoint() to reset .libPaths to the default user library. 
+# Note that this does not undo any of the other side-effects. Specifically, all
+# loaded packages remain loaded, and the value of getOption("repos") remains
+# unchanged. See details with ?unCheckpoint
+```
+
+
+# Data preparation
+
+## Get raster data
+
+### Define AOI {.tabset .tabset-fade}
+
+#### AOI as matrix
+
+Define an area of interest (AOI). Here I used a matrix that defines the corners of a square (unprojected coordinates in WGS84 datum):
+
+```{r aoi-matrix}
+#                       long    lat
+aoi <- matrix(data = c(22.85, 45.93,  # Upper left corner
+                       22.95, 45.93,  # Upper right corner
+                       22.95, 45.85,  # Bottom right corner
+                       22.85, 45.85,  # Bottom left corner
+                       22.85, 45.93), # Upper left corner - closure
+              ncol = 2, byrow = TRUE)
+set_aoi(aoi)
+view_aoi()
+```
+
+#### AOI as shapefile
+
+Note that, in case you have a shapefile of the aoi, you can then use it instead of building the matrix as above. You can read it with `rgdal::readOGR()` or `sf::st_read()`, example:
+```{r aoi-shapefile, eval=FALSE}
+aoi <- rgdal::readOGR(dsn   = "./data/my_aoi", 
+                      layer = "my_aoi", 
+                      stringsAsFactors = FALSE)
+
+aoi <- sf::st_read(dsn = "./data/my_aoi.shp",
+                   stringsAsFactors = FALSE)
+```
+
+### Query API & download
+
+First, you have to register to the Copernicus Open Access Hub ([COAH][COAH]). Their user guide illustrates [here][COAH-reg-help] how to just do that.
+
+[COAH-reg-help]: https://scihub.copernicus.eu/userguide/SelfRegistration
+
+```{r COAH-login, eval=FALSE}
+# Set login credentials
+login_CopHub(username = "happy_user", password = "something-more-than-1234")
+
+# Set the archive directory (where the raw data will be downloaded)
+set_archive("./data")
+```
+
+<br><br>
+
+Search for data and filter the records:
+```{r COAH-query, eval=FALSE}
+records <- getSentinel_query(time_range = c("2017-05-15",
+                                            as.character(Sys.Date())), 
+                             platform = "Sentinel-2")
+```
+
+```{r filter-records}
+records_filtered <- records %>% 
+  filter(processinglevel == "Level-2A") %>% 
+  filter(cloudcoverpercentage <= 1)
+```
+
+<br><br>
+
+Preview records on a mapview map with the AOI. I was hoping to get good data for the lowest cloud coverage, but when visualizing it, I realized that data is incomplete. I am better off with some other record with very low cloud coverage. This proves that one needs to visually check the data in order to be sure one gets usable records.
+
+```{r preview-records-no-eval, eval=FALSE}
+idx_min_clowd_cov <- which.min(records_filtered$cloudcoverpercentage)
+getSentinel_preview(record = records_filtered[idx_min_clowd_cov,])
+getSentinel_preview(record = records_filtered[2,])
+```
+
+```{r preview-records, echo=FALSE, out.width=c('50%', '50%'), fig.show='hold', fig.asp=0.5, fig.align="center", fig.cap="Left - record for the lowest cloud coverage (is incomplete); right - final selected record for analysis"}
+img_rec_cloud_min <- readPNG("./img/chunk-preview-records-cloud-min.png")
+grid.raster(img_rec_cloud_min)
+img_rec_2 <- readPNG("./img/chunk-preview-records-2.png")
+grid.newpage()
+grid.raster(img_rec_2)
+```
+
+<br><br>
+
+Get and uzip the data:
+```{r get-data, eval=FALSE}
+datasets <- getSentinel_data(records = records_filtered[2,])
+## Downloading 'S2B_MSIL2A_20181016T092029_N0209_R093_T34TFR_20181016T143428' to 
+## './data//get_data/Sentinel-2//S2B_MSIL2A_20181016T092029_N0209_R093_T34TFR_20181016T143428.zip'...
+## |====================================================================| 100%
+## Successfull download, MD5 check sums match.
+## All downloads have been succesfull (1 attempts).
+unzip(zipfile = datasets, exdir = "./data")
+```
+
+### Crop raster images
+
+Read and crop the raster bands: B2, B3, B4, B5, B6, B7, B8, B8A, B11 and B12:
+```{r read-jp2, eval=FALSE}
+# Path to jp2 files
+jp2_path <- "./data/S2B_MSIL2A_20181016T092029_N0209_R093_T34TFR_20181016T143428.SAFE/GRANULE/L2A_T34TFR_A008413_20181016T092720/IMG_DATA/"
+# From the folder "R10m", read B02, B03, B04 and B08. They are the only files containing "B".
+jp2_10m <- list.files(paste0(jp2_path, "R10m"), pattern = ".*B.*jp2$", full.names = TRUE)
+# From the folder "R20m", read B5, B6, B7, B8A, B11 and B12.
+jp2_20m <- list.files(paste0(jp2_path, "R20m"), pattern = ".*B.*[56781].*jp2$", full.names = TRUE)
+
+# Read all bands
+rst_lst <- lapply(c(jp2_10m, jp2_20m), FUN = raster)
+```
+
+<br><br>
+
+Prepare the extent for cropping from AOI. Don't forget to project the coordinates to the CRS of the sentinel raster datasets, which is `r proj4string(rst_crop_lst[[1]])`.
+```{r extent, eval=FALSE}
+extent_crop <- aoi %>% 
+  project(proj = proj4string(rst_lst[[1]])) %>% 
+  apply(MARGIN = 2, FUN = range) %>% # get the range for the two columns - long and lat
+  t %>% # transpose so to get the 2x2 matrix expected by extent()
+  extent # make extent from 2x2 matrix (first row: xmin, xmax; second row: ymin, ymax)
+```
+
+<br><br>
+
+Crop the bands
+```{r crop, eval=FALSE}
+rst_crop_lst <- lapply(rst_lst, FUN = raster::crop, y = extent_crop)
+# Short name for each bands (each element of the list of cropped bands)
+names(rst_crop_lst) <- str_extract(sapply(rst_crop_lst, names), "B.{2}")
+```
+
+<br><br>
+
+Visualize the crop in Natural Color (R = Red, G = Green, B = Blue).
+```{r view-rgb}
+viewRGB(brick(rst_crop_lst[1:3]), r = 3, g = 2, b = 1)
+```
+
+<br><br>
+
+Save the cropped bands so that we can delete the raw original ones in order to save some space (this is optional, but I need the space...). For the purpose of being able to build faster this document I cached the results and are read in the setup chunk at the top of the rmd file. Also I can't actually be expected to download data from the Copernicus API every time I build this document from its rmarkdown file :)
+```{r save-geotif, eval=FALSE}
+path_crop <- paste0("./data/crop/", names(rst_crop_lst), ".tif")
+
+for (i in 1:length(rst_crop_lst)){
+  writeRaster(x = rst_crop_lst[[i]],
+              filename = path_crop[i],
+              format   = "GTiff",
+              datatype = dataType(rst_crop_lst[[i]]),
+              options  = "TFW=YES")
+}
+```
+
+### Resample bands
+
+The 20 m bands were resampled to 10 m. Resampling is needed because otherwise one cannot build a `brick` raster object to be used for predictions - see [visualize classifications](#visualize-classifications).
+
+```{r resample, eval=FALSE, message=FALSE}
+rst_for_prediction <- vector(mode = "list", length = length(rst_crop_lst))
+names(rst_for_prediction) <- names(rst_crop_lst)
+
+for (b in c("B05", "B06", "B07", "B8A", "B11", "B12")){
+  beginCluster(n = round(3/4 * detectCores()))
+  try(
+    rst_for_prediction[[b]] <- raster::resample(x = rst_crop_lst[[b]],
+                                                y = rst_crop_lst$B02)
+  )
+  endCluster()
+}
+
+b_10m <- c("B02", "B03", "B04", "B08")
+rst_for_prediction[b_10m] <- rst_crop_lst[b_10m]
+brick_for_prediction <- brick(rst_for_prediction)
+```
+
+### Center & scale raster images
+
+This process involves subtracting the mean and dividing by the standard deviation for each variable/feature/band. Is not that data needs normalization as in the case of linear regression which assumes a Gaussian distribution of the response/predicted variable, but the transformation seems to be important for the ML algorithms, especially for the neural networks as mentioned [here](https://stats.stackexchange.com/a/7759/95505), or depicted [here](https://stackoverflow.com/a/46688787/5193830).
+
+```{r}
+brick_for_prediction_norm <- normImage(brick_for_prediction)
+names(brick_for_prediction_norm) <- names(brick_for_prediction)
+```
+
+## Data from training polygons
+
+### Polygons to points
+
+Read the training polygons.
+```{r read-polys, message=FALSE, warning=FALSE, results='hide'}
+poly <- rgdal::readOGR(dsn   = "./data/train_polys", 
+                       layer = "train_polys", 
+                       stringsAsFactors = FALSE)
+# Need to have a numeric id for each class - helps with rasterization later on.
+poly@data$id <- as.integer(factor(poly@data$class))
+setDT(poly@data)
+```
+
+<br><br>
+
+Plot them:
+```{r}
+# Prepare colors for each class.
+cls_dt <- unique(poly@data) %>% 
+  arrange(id) %>% 
+  mutate(hex = c(agriculture  = "#ff7f00",
+                 construction = "#e41a1c",
+                 forest       = "#4daf4a",
+                 pasture      = "#984ea3",
+                 water        = "#377eb8"))
+
+view_aoi(color = "#a1d99b") + 
+  mapView(poly, zcol = "class", col.regions = cls_dt$hex)
+```
+
+The polygons need to be projected using the Sentinel's CRS.
+```{r}
+poly_utm <- sp::spTransform(poly, CRSobj = rst_crop_lst[[1]]@crs)
+```
+
+<br><br>
+
+**Rasterize the polygons** to 10 m resolution, convert the raster to points and then use them to extract values from the Sentinel bands.
+```{r rasterize}
+# Create raster template
+template_rst <- raster(extent(rst_crop_lst$B02), # band B2 has resolution 10 m
+                       resolution = 10,
+                       crs = projection(rst_crop_lst$B02))
+poly_utm_rst <- rasterize(poly_utm, template_rst, field = 'id')
+
+poly_dt <- as.data.table(rasterToPoints(poly_utm_rst))
+setnames(poly_dt, old = "layer", new = "id_cls")
+
+points <- SpatialPointsDataFrame(coords = poly_dt[, .(x, y)],
+                                 data = poly_dt,
+                                 proj4string = poly_utm_rst@crs)
+```
+
+### Extract band values to points {.tabset .tabset-fade}
+
+#### data.table syntax
+
+If the `data.table` syntax is too foreign for you, then can check the `dplyr` syntax tab.
+
+```{r training-dt}
+dt <- brick_for_prediction_norm %>% 
+  extract(y = points) %>% 
+  as.data.table %>% 
+  .[, id_cls := points@data$id_cls] %>%  # add the class names to each row
+  merge(y = unique(poly@data), by.x = "id_cls", by.y = "id", all = TRUE, sort = FALSE) %>% 
+  .[, id_cls := NULL] %>% # this column is extra now, delete it
+  .[, class := factor(class)]
+
+# View the first 6 rows
+head(dt)
+```
+
+#### dplyr syntax
+
+```{r}
+dt2 <- brick_for_prediction_norm %>% 
+  extract(y = points) %>%  
+  as.data.frame %>% 
+  mutate(id_cls = points@data$id_cls) %>% # add the class names to each row
+  left_join(y = unique(poly@data), by = c("id_cls" = "id")) %>% 
+  mutate(id_cls = NULL) %>% # this column is extra now, delete it
+  mutate(class = factor(class))
+
+setDT(dt2)
+identical(dt, dt2)
+rm(dt2)
+```
+
+### Histograms of predictors
+
+```{r}
+dt %>% 
+  select(-"class") %>% 
+  melt(measure.vars = names(.)) %>% 
+  ggplot() +
+  geom_histogram(aes(value)) +
+  geom_vline(xintercept = 0, color = "gray70") +
+  facet_wrap(facets = vars(variable), ncol = 3)
+```
+
+## Split into train and test
+
+The training dataset will be used for model tuning by cross-validation and grid search. Then will use the final tuned models on the test dataset to build confusion matrices (as showed in the intro vignette of caret package, [here][caret-intro]).
+
+[caret-intro]: https://cran.r-project.org/web/packages/caret/vignettes/caret.html
+
+```{r split-data}
+set.seed(321)
+# A stratified random split of the data
+idx_train <- createDataPartition(dt$class,
+                                 p = 0.7, # percentage of data as training
+                                 list = FALSE)
+dt_train <- dt[idx_train]
+dt_test <- dt[-idx_train]
+
+table(dt_train$class)
+table(dt_test$class)
+```
+
+# Fit models
+
+The training dataset is used for carrying cross-validation (CV) and grid search for model tuning. Once the optimal/best parameters were found a final model is fit to the entire training dataset using those findings. Further we can check how these final models behave on unseen data (the testing dataset).
+
+Details are provided in the intro vignette of caret package, [here][caret-intro] and also in [this][scikit-cv] documentation of scikit-learn.
+
+[scikit-cv]: https://scikit-learn.org/stable/modules/cross_validation.html
+
+The CV indices need to match when comparing multiple models, so to get a fair comparison. Therefore, `folds` will pass to `trainControl` argument for each type of model. See also the example from `help(trainControl)`.
+```{r set-seeds}
+# create cross-validation folds (splits the data into n random groups)
+n_folds <- 10
+set.seed(321)
+folds <- createFolds(1:nrow(dt_train), k = n_folds)
+# Set the seed at each resampling iteration. Useful when running CV in parallel.
+seeds <- vector(mode = "list", length = n_folds + 1) # +1 for the final model
+for(i in 1:n_folds) seeds[[i]] <- sample.int(1000, n_folds)
+seeds[n_folds + 1] <- sample.int(1000, 1) # seed for the final model
+```
+
+<br><br>
+
+Note that, for each model, in `trainControl` we need to provide the followings:
+```{r set-trainControl}
+ctrl <- trainControl(summaryFunction = multiClassSummary,
+                     method = "cv",
+                     number = n_folds,
+                     search = "grid",
+                     classProbs = TRUE, # not implemented for SVM; will just get a warning
+                     savePredictions = TRUE,
+                     index = folds,
+                     seeds = seeds)
+```
+
+
+All in all, this is important for being able to compare the different type of models; see details in the chapter "Selecting models: a case study in churn prediction" in [Data Camp - Machine Learning Toolbox][dc-mlt].
+
+[dc-mlt]: https://www.datacamp.com/courses/machine-learning-toolbox
+
+***
+
+Models can be also tuned manually. `caret` does it automatically anyways, choosing some default values for us. Manual tuning means picking some desired values for tuning the model parameters instead the default ones. So, you can have more fine-grained control over the tuning parameters.
+
+Manual tuning is done via the `tuneGrid` argument, and of course, differs from model to model, e.g.:
+
+- for the random forest models there can be the `mtry` parameter (the number of randomly selected predictors, k, to choose from at each split);
+- for svm models, can be the `cost` and `Loss` function;
+- for neural networks, can be `size` and `decay`
+
+See details in [Kuhn, M., & Johnson, K. (2013). Applied predictive modeling (Vol. 26). New York: Springer][apm] or [Hastie, T., James, G., Tibshirani, R., & Witten, D. (2013). An introduction to statistical learning with applications in R][islar].
+
+[apm]: https://www.springer.com/us/book/9781461468486
+[islar]: https://www-bcf.usc.edu/~gareth/ISL/
+
+***
+
+**List of available models with `caret`** - [train Models By Tag](http://topepo.github.io/caret/train-models-by-tag.html)
+
+## Random forest
+
+```{r model_rf, eval=FALSE}
+# Register a doParallel cluster, using 3/4 (75%) of total CPU-s
+cl <- makeCluster(3/4 * detectCores())
+registerDoParallel(cl)
+model_rf <- caret::train(class ~ . , method = "rf", data = dt_train,
+                         importance = TRUE, # passed to randomForest()
+                         # run CV process in parallel;
+                         # see https://stackoverflow.com/a/44774591/5193830
+                         allowParallel = TRUE,
+                         tuneGrid = data.frame(mtry = c(2, 3, 4, 5, 8)),
+                         trControl = ctrl)
+stopCluster(cl); remove(cl)
+# Unregister the doParallel cluster so that we can use sequential operations
+# if needed; details at https://stackoverflow.com/a/25110203/5193830
+registerDoSEQ()
+saveRDS(model_rf, file = "./cache/model_rf.rds")
+```
+
+### Model summary & confusion matrix
+
+Tuning here was done via the `mtry` argument, which can vary from 2 up to total number of predictors (bands) used (here, `r length(rst_crop_lst)`).
+
+So, the optimization was done via cross validation and grid search (here by grid I refer to `tuneGrid = data.frame(mtry = c(2, 3, 4, 5, 8))`). The final/optimal, model stored in `model_rf,` corresponds to `mtry` = `r model_rf$bestTune$mtry` with the highest accuracy = `r format(model_rf$results$Accuracy[model_rf$bestTune$mtry], digits = 3)`.
+
+```{r out.width='50%', fig.align="center"}
+model_rf$times$everything # total computation time
+plot(model_rf) # tuning results
+# ggplot(model_rf) # same as above, but using the ggplot method from caret
+```
+
+<br><br>
+
+Compute the **confusion matrix** and associated statistics using the test data. A confusion matrix indicates how "confused" the model is between the given classes and highlights instances in which one class is confused for another. The main (first) diagonal of the matrix shows the cases when the model is "correct" ([Data Camp - Machine Learning Toolbox][dc-mlt]).
+
+- **Accuracy** looks really high, far better that the "no-information-rate" model which always predicts the dominant class (here, the first level of the `class` factor - `r levels(dt_train$class)[1]`);
+- **Sensitivity** (Recall) refers to the **true positive rate** (model correctly detects the class);
+- **Specificity** is the **true negative rate** (model correctly rejects the class)
+
+See also this [Wikipedia link][wiki-sen-spe], [this one][wiki-conf-mat] or `help(confusionMatrix)` for more details on confusion matrix terminology.
+
+[wiki-sen-spe]: https://en.wikipedia.org/wiki/Sensitivity_and_specificity
+[wiki-conf-mat]: https://en.wikipedia.org/wiki/Confusion_matrix
+
+```{r}
+cm_rf <- confusionMatrix(data = predict(model_rf, newdata = dt_test),
+                         dt_test$class)
+cm_rf
+```
+
+<br><br>
+
+You can also get a confusion matrix for the final model using the entire train dataset. This is different from the approach above. However, you would usually want to see a confusion matrix based on the testing dataset. In both cases one can see that the model is the most confused about distinguishing between the pasture and agriculture land use classes. On the other hand, the model "seems super certain" when classifying water.
+```{r}
+model_rf$finalModel
+```
+
+
+### Predictor importance
+
+**Simple rule**: higher values mean the variables are more important.
+
+So, band 11 seems to be very important for detecting pasture patches.
+
+***
+
+For more in depth details about predictor importance, check the work of [Kuhn, M., & Johnson, K. (2013). Applied predictive modeling (Vol. 26). New York: Springer][apm], specifically, chapters 18 *Measuring Predictor Importance* and 8.5 *Random Forests*. Also check this Stack Overflow [link][rf-imp].
+
+[rf-imp]: https://stackoverflow.com/questions/736514/r-random-forests-variable-importance
+
+Some selected ideas:
+
+-	The importance values indicate the loss in performance when the effect of the predictor is negated. So, a substantial drop in performance is indicative of an important predictor;
+-	Correlations between predictors can have a significant impact on the importance values (case of uninformative predictors highly correlated with informative ones get abnormally high importance);
+-	Correlated important predictors can dilute each other (render each other artificially unimportant)
+
+From the R syntax point of view, there are several ways to get *importance* values and metrics for each band:
+
+- `caret::varImp()`, generic method, so will work also for svm and nnet models;
+- `randomForest::importance()` & `randomForest::varImpPlot`, work only for `randomForest` models
+
+Note that, by default the `scale` argument in both `caret::varImp()` and `randomForest::importance()` is set to TRUE. However, in `caret::varImp()` it means that the importance values are scaled between 0 and 100 %, while this doesn't seem to be true in the case of `randomForest::importance()`. One way or another, the conveyed information is the same, as you can see from the two heatmaps below. To get identical results, set `scale = FALSE` in `caret::varImp()`. 
+
+***
+
+```{r rf-importance, out.width=c('50%', '50%', '100%'), fig.show='hold', fig.asp=0.5, fig.align="center"}
+caret::varImp(model_rf)$importance %>%
+  as.matrix %>% 
+  plot_ly(x = colnames(.), y = rownames(.), z = ., type = "heatmap",
+          width = 350, height = 300)
+
+randomForest::importance(model_rf$finalModel) %>% 
+  .[, - which(colnames(.) %in% c("MeanDecreaseAccuracy", "MeanDecreaseGini"))] %>% 
+  plot_ly(x = colnames(.), y = rownames(.), z = ., type = "heatmap",
+          width = 350, height = 300)
+
+randomForest::varImpPlot(model_rf$finalModel)
+```
+
+## SVM
+
+"L2 Regularized Support Vector Machine (dual) with Linear Kernel". To try other SVM options see [SVM tags][svm-tags].
+
+[svm-tags]: http://topepo.github.io/caret/train-models-by-tag.html#support-vector-machines
+
+Note that, `importance = TRUE` is not applicable anymore, so I didn't mentioned it in `train()`. Same for class probabilities `classProbs = TRUE` defined in `ctrl` above. However, I didn't bother to make another `ctrl` object for SVM, so it works to recycle the one used for the random forests models with ignoring the warning: *Class probabilities were requested for a model that does not implement them*.
+
+```{r model_svm, eval=FALSE}
+# Grid of tuning parameters
+svm_grid <- expand.grid(cost = c(0.2, 0.5, 1),
+                        Loss = c("L1", "L2"))
+
+cl <- makeCluster(3/4 * detectCores())
+registerDoParallel(cl)
+model_svm <- caret::train(class ~ . , method = "svmLinear3", data = dt_train,
+                         allowParallel = TRUE,
+                         tuneGrid = svm_grid,
+                         trControl = ctrl)
+stopCluster(cl); remove(cl)
+registerDoSEQ()
+# Warning message:
+# In train.default(x, y, weights = w, ...) :
+#   Class probabilities were requested for a model that does not implement them
+# (see why above)
+saveRDS(model_svm, file = "./cache/model_svm.rds")
+```
+
+### Model summary & confusion matrix
+```{r out.width='50%', fig.align="center"}
+model_svm$times$everything # total computation time
+plot(model_svm) # tuning results
+
+# The confusion matrix using the test dataset
+cm_svm <- confusionMatrix(data = predict(model_svm, newdata = dt_test),
+                          dt_test$class)
+cm_svm
+```
+
+## Neural Network
+
+To try other Neural Network options see [Neural Network tags][nnet-tags].
+
+[nnet-tags]: http://topepo.github.io/caret/train-models-by-tag.html#neural-network
+
+```{r model_nnet, eval=FALSE}
+# Grid of tuning parameters
+nnet_grid <- expand.grid(size = c(5, 10, 15),
+                         decay = c(0.001, 0.01, 0.1))
+
+cl <- makeCluster(3/4 * detectCores())
+registerDoParallel(cl)
+model_nnet <- train(class ~ ., method = 'nnet', data = dt_train,
+                    importance = TRUE,
+                    maxit = 1000, # set high enough so to be sure that it converges
+                    allowParallel = TRUE,
+                    tuneGrid = nnet_grid,
+                    trControl = ctrl)
+stopCluster(cl); remove(cl)
+registerDoSEQ()
+saveRDS(model_nnet, file = "./cache/model_nnet.rds")
+```
+
+### Model summary & confusion matrix
+```{r out.width='50%', fig.align="center"}
+model_nnet$times$everything # total computation time
+plot(model_nnet) # tuning results
+
+# The confusion matrix using the test dataset
+cm_nnet <- confusionMatrix(data = predict(model_nnet, newdata = dt_test),
+                           dt_test$class)
+cm_nnet
+```
+
+<br><br>
+
+Get variable relative importance and plot the neural network. Check out the package [NeuralNetTools][NeuralNetTools] for more details. Helpful can be [this Q&A link](https://datascience.stackexchange.com/q/6391/17854) as well.
+
+[NeuralNetTools]:https://github.com/fawda123/NeuralNetTools
+
+```{r nnet-importance, out.width='50%', fig.show='hold', fig.asp=0.5, fig.align="center"}
+cols <- grDevices::colorRampPalette(colors = brewer.pal(n = 9, name = "YlGnBu"))(10)
+
+garson(model_nnet) +
+  scale_y_continuous('Rel. Importance') + 
+  scale_fill_gradientn(colours = cols)
+```
+
+<br><br>
+
+Plot as a neural interpretation diagram, though not super useful here.
+```{r}
+cols_rank_import <- cols[rank(garson(model_nnet, bar_plot = FALSE)$rel_imp)]
+plotnet(model_nnet, circle_col = list(cols_rank_import, 'lightblue'))
+```
+
+
+# Compare models
+
+We'll compare the three types of models using the framework set by the `caret` package via `resamples()` function as long as the train indices of the observations match (which we made sure they do by setting specific seeds). Here we compare the results obtained via cross validation on the train dataset when we tuned the models.
+
+```{r model-resamples}
+# Create model_list
+model_list <- list(rf = model_rf, svm = model_svm, nnet = model_nnet)
+# Pass model_list to resamples()
+resamples <- caret::resamples(model_list)
+```
+
+<br><br>
+
+In general, the model with the higher median accuracy is the "winner", as well as a smaller range between min and max accuracy.
+```{r}
+# All metrics with boxplots
+bwplot(resamples)
+resamples$metrics
+```
+
+<br><br>
+
+Paired t-tests:
+```{r}
+t_tests <- resamples %>%
+  diff(metric = "Accuracy") %>%
+  summary
+t_tests
+# resamples %>% diff %>% summary # for all metrics
+```
+The paired t-tests with Bonferroni multi-test corrections on p-values show that there are significant differences between the neural network model and the other two, while there are no significant differences between the random forest and SVM models. In this case we can choose the neural network model as the "best" kind of model. However, the differences are really small between accuracies. If you want to run tests on all metrics, then just skip the metric argument. The neural network has a marginally better accuracy than the random forest model, only by `r format(abs(as.numeric(t_tests$table$Accuracy[1,3]))*100, digits = 3)`%.
+
+## Visualize classifications
+
+Note that the synchronizing capabilities of the `mapview` package are interesting to use, but for now there is a bug in displaying correctly the labels in the legends (I submitted an issue on GitHub [here](https://github.com/r-spatial/mapview/issues/214)).
+
+```{r predictions}
+system.time({
+  predict_rf <- raster::predict(object = brick_for_prediction_norm,
+                                model = model_rf, type = 'raw')
+  predict_svm <- raster::predict(object = brick_for_prediction_norm,
+                                 model = model_svm, type = 'raw')
+  predict_nnet <- raster::predict(object = brick_for_prediction_norm,
+                                  model = model_nnet, type = 'raw')
+})
+```
+
+```{r mapview-pred, message=FALSE, warning=FALSE}
+sync(viewRGB(brick(rst_crop_lst[1:3]), r = 3, g = 2, b = 1) +
+       mapView(poly, zcol = "class", col.regions = cls_dt$hex),
+     mapView(predict_rf, col.regions = cls_dt$hex), 
+     mapView(predict_svm, col.regions = cls_dt$hex),
+     mapView(predict_nnet, col.regions = cls_dt$hex))
+
+cls_dt
+```
