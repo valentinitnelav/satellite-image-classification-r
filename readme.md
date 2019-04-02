@@ -1,6 +1,6 @@
 This repository is a sandbox for experimenting with the R [caret][caret] package - using *Random Forests*, *Support Vector Machines* and *Neural Networks* for a classic [pixel based][px-b] [supervised classification][sup-cl]/[supervised learning][sup-ln] of [Sentinel-2 multispectral images][s2].
 
-**View page at https://valentinitnelav.github.io/satellite-image-classification-r/ **
+View page at https://valentinitnelav.github.io/satellite-image-classification-r/
 
 [caret]: https://cran.r-project.org/web/packages/caret/index.html
 [px-b]: https://gis.stackexchange.com/questions/237461/distinction-between-pixel-based-and-object-based-classification
